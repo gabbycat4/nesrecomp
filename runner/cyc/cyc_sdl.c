@@ -1520,6 +1520,8 @@ static struct {
 static FILE *cyc_pacing_log_file;
 static Uint64 s_pace_frame_start, s_pace_emu_done, s_pace_extras_done;   /* CYC_PACING_LOG */
 
+static SDL_sem *s_emu_done;   /* the emulation thread's "frame done" (below) */
+
 static void ib_present(Uint64 deadline, const char *toast_title, const char *toast_body)
 {
     const Uint64 freq = SDL_GetPerformanceFrequency();
@@ -1531,6 +1533,16 @@ static void ib_present(Uint64 deadline, const char *toast_title, const char *toa
         if (at >= deadline || t >= deadline) {
             if (pl) fprintf(pl, " [%llu later]", (unsigned long long)s_ib.i);
             return;                               /* during the next frame, if at all */
+        }
+        /* While the next frame runs (no deadline): once it has finished, an
+         * in-between picture still to come would hold up that frame's own
+         * picture. Waiting for it made the frame late, the late frame lost
+         * all its in-between pictures and showed its picture early, the next
+         * one late again: 150 of 240 pictures a second (Mega Man 2's stage
+         * select, an even/odd rhythm that held for minutes). Leave it out. */
+        if (deadline == ~(Uint64)0 && t < at && s_emu_done && SDL_SemValue(s_emu_done) > 0) {
+            if (pl) fprintf(pl, " [%llu dropped]", (unsigned long long)s_ib.i);
+            break;
         }
         if (t < at) {
             Uint32 wait_ms = (Uint32)((at - t) * 1000 / freq);
