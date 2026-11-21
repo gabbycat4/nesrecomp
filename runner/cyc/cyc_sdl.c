@@ -1633,6 +1633,10 @@ static SDL_Thread *s_emu_thread;
 static SDL_sem *s_emu_go, *s_emu_done;
 static volatile int s_emu_quit;
 
+/* CYC_PACING_LOG: when the emulation thread began and ended its frame. */
+static volatile Uint64 s_emu_t0, s_emu_t1;
+static bool s_pace_parallel;
+
 static int emu_main(void *unused)
 {
     (void)unused;
@@ -1640,7 +1644,9 @@ static int emu_main(void *unused)
     for (;;) {
         SDL_SemWait(s_emu_go);
         if (s_emu_quit) return 0;
+        s_emu_t0 = SDL_GetPerformanceCounter();
         cyc_run_frame();
+        s_emu_t1 = SDL_GetPerformanceCounter();
         SDL_SemPost(s_emu_done);
     }
 }
@@ -2069,7 +2075,9 @@ int cyc_sdl_main(const char *title_in, int scale)
                 !open && !inactive && !st.shortcut[CYC_SC_FAST_FORWARD] && !s_uncapped &&
                 !online && !replay;
             if (parallel_frame) cyc_zapper_state(&s_present_zapper);
+            s_pace_parallel = false;
             if (parallel_frame && emu_start()) {
+                s_pace_parallel = true;
                 s_emu_frame_active = true;
                 ib_present(~(Uint64)0, toast_title, toast_body);
                 SDL_SemWait(s_emu_done);
@@ -2180,6 +2188,10 @@ int cyc_sdl_main(const char *title_in, int scale)
                             (double)(s_pace_emu_done - s_pace_frame_start) * ms,
                             (double)(s_pace_extras_done - s_pace_emu_done) * ms,
                             (double)(pace_before - s_pace_extras_done) * ms);
+                    if (s_pace_parallel)   /* the emulation thread's own frame: started (from the frame start), ran */
+                        fprintf(pl, " thread start %+.2f run %.2f",
+                                (double)((long long)(s_emu_t0 - s_pace_frame_start)) * ms,
+                                (double)(s_emu_t1 - s_emu_t0) * ms);
                     fflush(pl);
                 }
                 cyc_pacing_log_file = pl;
