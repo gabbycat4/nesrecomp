@@ -92,6 +92,7 @@
 #include "recomp_launcher.h"
 #endif
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1505,6 +1506,64 @@ static void show(bool loading, const char *toast_title, const char *toast_body)
     }
 }
 
+/* ---- 59.94 frames a second at 240 pictures ----
+ * Four pictures per NTSC frame come at 4 x 60.0988 = 240.4 a second, just
+ * over a 240 Hz monitor: with VSync off and adaptive sync, every ~2.5 s a
+ * picture has to wait for the panel (a hitch). At a present rate of 240 (or
+ * any higher multiple of 60) the window paces the console at 59.94 frames a
+ * second instead (0.26% slower, not noticeable), so pictures come at 239.76.
+ * Only the wall-clock pacing changes: every frame, its input and its audio
+ * run exactly as before. The audio of a frame is stretched by the same
+ * 0.26% before it is queued (a pitch change of 4.6 cents), so the queue
+ * neither drains nor crackles. Not while online (both sides keep the
+ * console's rate) or for PAL. CYC_PACE_5994=0 turns it off. */
+static Uint64 paced_frame_ticks(double frame_seconds, Uint64 freq, bool online, double *stretch)
+{
+    static int allowed = -1;
+    static double reported = -1;
+    if (allowed < 0) { const char *e = getenv("CYC_PACE_5994"); allowed = !(e && e[0] == '0'); }
+    unsigned rate = s_extras && s_extras->present_phase ? s_extras->present_rate : 0;
+    double seconds = frame_seconds;
+    if (allowed && !online && rate >= 240 && rate % 60 == 0 && fabs(frame_seconds * 60.0988 - 1.0) < 0.001)
+        seconds = 1.0 / 59.94;
+    *stretch = seconds / frame_seconds;
+    if (seconds != reported) {
+        reported = seconds;
+        fprintf(stderr, "window: console paced at %.4f frames a second\n", 1.0 / seconds);
+    }
+    return (Uint64)(seconds * (double)freq);
+}
+
+/* Linear-interpolation stretch of the PCM stream by 1/step (step < 1: more
+ * samples out than in). Keeps the last sample and the fractional position
+ * between calls, so consecutive frames join without a seam. */
+static int16_t s_stretch_last;
+static double  s_stretch_t;
+static size_t stretch_audio(const int16_t *in, size_t n, int16_t *out, size_t cap, double step)
+{
+    if (!n) return 0;
+    size_t m = 0;
+    const double end = (double)(n - 1);
+    double p = s_stretch_t - 1.0;              /* -1 is s_stretch_last, 0 is in[0] */
+    while (p < end && m < cap) {
+        double fl = floor(p);
+        long i = (long)fl;
+        double f = p - fl;
+        double a = i < 0 ? (double)s_stretch_last : (double)in[i], b = (double)in[i + 1];
+        out[m++] = (int16_t)lrint(a + (b - a) * f);
+        p += step;
+    }
+    s_stretch_last = in[n - 1];
+    s_stretch_t = p - end;
+    if (!(s_stretch_t >= 0 && s_stretch_t < 1)) s_stretch_t = 0;
+    return m;
+}
+static void stretch_audio_follow(const int16_t *in, size_t n)
+{
+    if (n) s_stretch_last = in[n - 1];
+    s_stretch_t = 0;
+}
+
 /* ---- in-between pictures (cyc_host_extras.h present_rate) ----
  * Picture i after a machine frame's own picture (shown at s_ib.origin)
  * appears at origin + i * step and shows phase i * step / frame_ticks. Those
@@ -1794,7 +1853,8 @@ int cyc_sdl_main(const char *title_in, int scale)
     const char *pacing_path=getenv("NESRECOMP_PACING_LOG");
     FILE *pacing_log=pacing_path&&*pacing_path?fopen(pacing_path,"wb"):NULL;
     if(pacing_log){setvbuf(pacing_log,NULL,_IOFBF,65536);fprintf(pacing_log,"frequency,%llu,seconds,%.12f\n",(unsigned long long)freq,frame_seconds);}
-    const Uint64 frame_ticks = (Uint64)(frame_seconds * (double)freq);
+    Uint64 frame_ticks = (Uint64)(frame_seconds * (double)freq);   /* per loop: paced_frame_ticks */
+    double audio_stretch = 1.0;
     Uint64 next = SDL_GetPerformanceCounter();
     Uint64 fps_mark = next, shown = 0;
     const Uint64 measurement_start = next;
@@ -1956,6 +2016,7 @@ int cyc_sdl_main(const char *title_in, int scale)
         online=nes_netplay_active();
         if(online&&cyc_net_leaving()){s_running=false;break;}
 #endif
+        frame_ticks = paced_frame_ticks(frame_seconds, freq, online, &audio_stretch);
         if (online || (!open && !inactive)) {
             cyc_host_window_replay(s_frames_done, st.buttons, CYC_INPUT_PLAYERS);
             cyc_host_window_game_input(st.game_buttons, CYC_INPUT_PLAYERS);
@@ -2045,8 +2106,16 @@ int cyc_sdl_main(const char *title_in, int scale)
                 continue;
             if (s_set.volume < 100)
                 for (size_t i = 0; i < n; ++i) pcm[i] = (int16_t)(pcm[i] * s_set.volume / 100);
-            SDL_QueueAudio(dev, pcm, (Uint32)(n * sizeof(int16_t)));
-            audio_samples_queued += n;
+            if (audio_stretch != 1.0) {
+                int16_t wide[4096 + 64];
+                size_t m = stretch_audio(pcm, n, wide, sizeof(wide) / sizeof(wide[0]), 1.0 / audio_stretch);
+                SDL_QueueAudio(dev, wide, (Uint32)(m * sizeof(int16_t)));
+                audio_samples_queued += m;
+            } else {
+                stretch_audio_follow(pcm, n);
+                SDL_QueueAudio(dev, pcm, (Uint32)(n * sizeof(int16_t)));
+                audio_samples_queued += n;
+            }
         }
 #ifdef NESRECOMP_NET
         /* Keep audio extras inside the completed simulation tick, matching
